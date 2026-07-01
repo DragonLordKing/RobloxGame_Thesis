@@ -1,0 +1,646 @@
+--[[
+Name: ControlModule
+Class: ModuleScript
+Original path: game.StarterPlayer.StarterPlayerScripts.PlayerModule.ControlModule
+Exported from: Generation
+Original comments: removed
+Children: 12
+Properties: Archivable=false, LinkedSource=""
+Services: Players, RunService, UserInputService, GuiService, Workspace, VRService
+Requires:
+  - local Keyboard = require(script:WaitForChild("Keyboard"))
+  - local Gamepad = require(script:WaitForChild("Gamepad"))
+  - local DynamicThumbstick = require(script:WaitForChild("DynamicThumbstick"))
+  - local TouchThumbstick = require(script:WaitForChild("TouchThumbstick"))
+  - local ClickToMove = require(script:WaitForChild("ClickToMoveController"))
+  - local TouchJump = require(script:WaitForChild("TouchJump"))
+  - local VehicleController = require(script:WaitForChild("VehicleController"))
+Functions: NormalizeAngle, AverageAngle, getGamepadRightThumbstickPosition, ControlModule.new, ControlModule:GetMoveVector, ControlModule:GetEstimatedVRTorsoFrame, ControlModule:GetActiveController, ControlModule:UpdateActiveControlModuleEnabled, ControlModule:Enable, ControlModule:Disable, ControlModule:SelectComputerMovementModule, ControlModule:SelectTouchModule, ControlModule:calculateRawMoveVector, ControlModule:OnRenderStepped, ControlModule:updateVRMoveVector, ControlModule:OnHumanoidSeated, ControlModule:OnCharacterAdded, ControlModule:OnCharacterRemoving, ControlModule:UpdateTouchGuiVisibility, ControlModule:SwitchToController, ControlModule:UpdateMovementMode, ControlModule:CreateTouchGuiContainer, ControlModule:GetClickToMoveController, disable, enable
+Clean source lines: 627
+]]
+local ControlModule = {}
+ControlModule.__index = ControlModule
+
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local Workspace = game:GetService("Workspace")
+local UserGameSettings = UserSettings():GetService("UserGameSettings")
+local VRService = game:GetService("VRService")
+
+
+local CommonUtils = script.Parent:WaitForChild("CommonUtils")
+
+local Keyboard = require(script:WaitForChild("Keyboard"))
+local Gamepad = require(script:WaitForChild("Gamepad"))
+local DynamicThumbstick = require(script:WaitForChild("DynamicThumbstick"))
+
+local FFlagUserDynamicThumbstickSafeAreaUpdate do
+	local success, result = pcall(function()
+		return UserSettings():IsUserFeatureEnabled("UserDynamicThumbstickSafeAreaUpdate")
+	end)
+	FFlagUserDynamicThumbstickSafeAreaUpdate = success and result
+end
+
+local TouchThumbstick = require(script:WaitForChild("TouchThumbstick"))
+
+
+local ClickToMove = require(script:WaitForChild("ClickToMoveController"))
+local TouchJump = require(script:WaitForChild("TouchJump"))
+
+local VehicleController = require(script:WaitForChild("VehicleController"))
+
+local CONTROL_ACTION_PRIORITY = Enum.ContextActionPriority.Medium.Value
+local NECK_OFFSET = -0.7
+local FIRST_PERSON_THRESHOLD_DISTANCE = 5
+
+
+local movementEnumToModuleMap = {
+	[Enum.TouchMovementMode.DPad] = DynamicThumbstick,
+	[Enum.DevTouchMovementMode.DPad] = DynamicThumbstick,
+	[Enum.TouchMovementMode.Thumbpad] = DynamicThumbstick,
+	[Enum.DevTouchMovementMode.Thumbpad] = DynamicThumbstick,
+	[Enum.TouchMovementMode.Thumbstick] = TouchThumbstick,
+	[Enum.DevTouchMovementMode.Thumbstick] = TouchThumbstick,
+	[Enum.TouchMovementMode.DynamicThumbstick] = DynamicThumbstick,
+	[Enum.DevTouchMovementMode.DynamicThumbstick] = DynamicThumbstick,
+	[Enum.TouchMovementMode.ClickToMove] = ClickToMove,
+	[Enum.DevTouchMovementMode.ClickToMove] = ClickToMove,
+
+
+	[Enum.TouchMovementMode.Default] = DynamicThumbstick,
+
+	[Enum.ComputerMovementMode.Default] = Keyboard,
+	[Enum.ComputerMovementMode.KeyboardMouse] = Keyboard,
+	[Enum.DevComputerMovementMode.KeyboardMouse] = Keyboard,
+	[Enum.DevComputerMovementMode.Scriptable] = nil,
+	[Enum.ComputerMovementMode.ClickToMove] = ClickToMove,
+	[Enum.DevComputerMovementMode.ClickToMove] = ClickToMove,
+}
+
+function ControlModule.new()
+	local self = setmetatable({},ControlModule)
+
+
+	self.controllers = {}
+
+	self.activeControlModule = nil
+	self.activeController = nil
+	self.touchJumpController = nil
+	self.moveFunction = Players.LocalPlayer.Move
+	self.humanoid = nil
+	self.controlsEnabled = true
+
+
+	self.humanoidSeatedConn = nil
+	self.vehicleController = nil
+
+	self.touchControlFrame = nil
+	self.currentTorsoAngle = 0
+
+	self.inputMoveVector = Vector3.new(0,0,0)
+
+	self.vehicleController = VehicleController.new(CONTROL_ACTION_PRIORITY)
+
+	Players.LocalPlayer.CharacterAdded:Connect(function(char) self:OnCharacterAdded(char) end)
+	Players.LocalPlayer.CharacterRemoving:Connect(function(char) self:OnCharacterRemoving(char) end)
+	if Players.LocalPlayer.Character then
+		self:OnCharacterAdded(Players.LocalPlayer.Character)
+	end
+
+	RunService:BindToRenderStep("ControlScriptRenderstep", Enum.RenderPriority.Input.Value, function(dt)
+		self:OnRenderStepped(dt)
+	end)
+
+	UserGameSettings:GetPropertyChangedSignal("TouchMovementMode"):Connect(function()
+		self:UpdateMovementMode()
+	end)
+	Players.LocalPlayer:GetPropertyChangedSignal("DevTouchMovementMode"):Connect(function()
+		self:UpdateMovementMode()
+	end)
+
+	UserGameSettings:GetPropertyChangedSignal("ComputerMovementMode"):Connect(function()
+		self:UpdateMovementMode()
+	end)
+	Players.LocalPlayer:GetPropertyChangedSignal("DevComputerMovementMode"):Connect(function()
+		self:UpdateMovementMode()
+	end)
+
+
+	self.playerGui = nil
+	self.touchGui = nil
+	self.playerGuiAddedConn = nil
+
+	GuiService:GetPropertyChangedSignal("TouchControlsEnabled"):Connect(function()
+		self:UpdateMovementMode()
+		self:UpdateActiveControlModuleEnabled()
+	end)
+
+	UserInputService:GetPropertyChangedSignal("PreferredInput"):Connect(function()
+		self:UpdateMovementMode()
+	end)
+
+	self.playerGui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not self.playerGui then
+		self.playerGuiAddedConn = Players.LocalPlayer.ChildAdded:Connect(function(child)
+			if child:IsA("PlayerGui") then
+				self.playerGui = child
+				self.playerGuiAddedConn:Disconnect()
+				self.playerGuiAddedConn = nil
+				self:UpdateMovementMode()
+			end
+		end)
+	end
+
+	self:UpdateMovementMode()
+
+	return self
+end
+
+
+function ControlModule:GetMoveVector(): Vector3
+	if self.activeController then
+		return self.activeController:GetMoveVector()
+	end
+	return Vector3.new(0,0,0)
+end
+
+local function NormalizeAngle(angle): number
+	angle = (angle + math.pi*4) % (math.pi*2)
+	if angle > math.pi then
+		angle = angle - math.pi*2
+	end
+	return angle
+end
+
+local function AverageAngle(angleA, angleB): number
+	local difference = NormalizeAngle(angleB - angleA)
+	return NormalizeAngle(angleA + difference/2)
+end
+
+function ControlModule:GetEstimatedVRTorsoFrame(): CFrame
+	local headFrame = VRService:GetUserCFrame(Enum.UserCFrame.Head)
+	local _, headAngle, _ = headFrame:ToEulerAnglesYXZ()
+	headAngle = -headAngle
+	if not VRService:GetUserCFrameEnabled(Enum.UserCFrame.RightHand) or
+		not VRService:GetUserCFrameEnabled(Enum.UserCFrame.LeftHand) then
+		self.currentTorsoAngle = headAngle;
+	else
+		local leftHandPos = VRService:GetUserCFrame(Enum.UserCFrame.LeftHand)
+		local rightHandPos = VRService:GetUserCFrame(Enum.UserCFrame.RightHand)
+
+		local leftHandToHead = headFrame.Position - leftHandPos.Position
+		local rightHandToHead = headFrame.Position - rightHandPos.Position
+		local leftHandAngle = -math.atan2(leftHandToHead.X, leftHandToHead.Z)
+		local rightHandAngle = -math.atan2(rightHandToHead.X, rightHandToHead.Z)
+		local averageHandAngle = AverageAngle(leftHandAngle, rightHandAngle)
+
+		local headAngleRelativeToCurrentAngle = NormalizeAngle(headAngle - self.currentTorsoAngle)
+		local averageHandAngleRelativeToCurrentAngle = NormalizeAngle(averageHandAngle - self.currentTorsoAngle)
+
+		local averageHandAngleValid =
+			averageHandAngleRelativeToCurrentAngle > -math.pi/2 and
+			averageHandAngleRelativeToCurrentAngle < math.pi/2
+
+		if not averageHandAngleValid then
+			averageHandAngleRelativeToCurrentAngle = headAngleRelativeToCurrentAngle
+		end
+
+		local minimumValidAngle = math.min(averageHandAngleRelativeToCurrentAngle, headAngleRelativeToCurrentAngle)
+		local maximumValidAngle = math.max(averageHandAngleRelativeToCurrentAngle, headAngleRelativeToCurrentAngle)
+
+		local relativeAngleToUse = 0
+		if minimumValidAngle > 0 then
+			relativeAngleToUse = minimumValidAngle
+		elseif maximumValidAngle < 0 then
+			relativeAngleToUse = maximumValidAngle
+		end
+
+		self.currentTorsoAngle = relativeAngleToUse + self.currentTorsoAngle
+	end
+
+	return CFrame.new(headFrame.Position) * CFrame.fromEulerAnglesYXZ(0, -self.currentTorsoAngle, 0)
+end
+
+function ControlModule:GetActiveController()
+	return self.activeController
+end
+
+
+function ControlModule:UpdateActiveControlModuleEnabled()
+
+	local disable = function()
+		self.activeController:Enable(false)
+		if self.touchJumpController then
+			self.touchJumpController:Enable(false)
+		end
+
+		if self.moveFunction then
+			self.moveFunction(Players.LocalPlayer, Vector3.new(0,0,0), true)
+		end
+	end
+
+	local enable = function()
+		if self.touchControlFrame and (UserInputService.PreferredInput == Enum.PreferredInput.Touch)
+			and (
+				self.activeControlModule == ClickToMove
+				or self.activeControlModule == TouchThumbstick
+				or self.activeControlModule == DynamicThumbstick
+			)
+		then
+			if not self.controllers[TouchJump] then
+				self.controllers[TouchJump] = TouchJump.new()
+			end
+			self.touchJumpController = self.controllers[TouchJump]
+			self.touchJumpController:Enable(true, self.touchControlFrame)
+		else
+			if self.touchJumpController then
+				self.touchJumpController:Enable(false)
+			end
+		end
+
+		if self.activeControlModule == ClickToMove then
+
+
+			self.activeController:Enable(
+				true,
+				Players.LocalPlayer.DevComputerMovementMode == Enum.DevComputerMovementMode.UserChoice,
+				self.touchJumpController
+			)
+		elseif self.touchControlFrame then
+			self.activeController:Enable(true, self.touchControlFrame)
+		else
+			self.activeController:Enable(true)
+		end
+	end
+
+
+	if not self.activeController then
+		return
+	end
+
+
+	if not self.controlsEnabled then
+		disable()
+		return
+	end
+
+
+	if not GuiService.TouchControlsEnabled and UserInputService.PreferredInput == Enum.PreferredInput.Touch and
+		(self.activeControlModule == ClickToMove or self.activeControlModule == TouchThumbstick or
+			self.activeControlModule == DynamicThumbstick) then
+		disable()
+		return
+	end
+
+
+	enable()
+end
+
+function ControlModule:Enable(enable: boolean?)
+	if enable == nil then
+		enable = true
+	end
+	if self.controlsEnabled == enable then return end
+	self.controlsEnabled = enable
+
+	if not self.activeController then
+		return
+	end
+
+	self:UpdateActiveControlModuleEnabled()
+end
+
+
+function ControlModule:Disable()
+	self:Enable(false)
+end
+
+
+function ControlModule:SelectComputerMovementModule(): ({}?, boolean)
+	if not (UserInputService.KeyboardEnabled or UserInputService.GamepadEnabled) then
+		return nil, false
+	end
+
+	local computerModule
+	local DevMovementMode = Players.LocalPlayer.DevComputerMovementMode
+
+	if DevMovementMode == Enum.DevComputerMovementMode.UserChoice then
+		if UserInputService.PreferredInput == Enum.PreferredInput.Gamepad then
+			computerModule = Gamepad
+		elseif UserInputService.PreferredInput == Enum.PreferredInput.KeyboardAndMouse then
+			computerModule = Keyboard
+		end
+
+		if UserGameSettings.ComputerMovementMode == Enum.ComputerMovementMode.ClickToMove and computerModule == Keyboard then
+
+			computerModule = ClickToMove
+		end
+	else
+
+		computerModule = movementEnumToModuleMap[DevMovementMode]
+
+
+		if (not computerModule) and DevMovementMode ~= Enum.DevComputerMovementMode.Scriptable then
+			warn("No character control module is associated with DevComputerMovementMode ", DevMovementMode)
+		end
+	end
+
+	if computerModule then
+		return computerModule, true
+	elseif DevMovementMode == Enum.DevComputerMovementMode.Scriptable then
+
+		return nil, true
+	else
+
+
+		return nil, false
+	end
+end
+
+
+function ControlModule:SelectTouchModule(): ({}?, boolean)
+	local touchModule
+	local DevMovementMode = Players.LocalPlayer.DevTouchMovementMode
+	if DevMovementMode == Enum.DevTouchMovementMode.UserChoice then
+		touchModule = movementEnumToModuleMap[UserGameSettings.TouchMovementMode]
+	elseif DevMovementMode == Enum.DevTouchMovementMode.Scriptable then
+		return nil, true
+	else
+		touchModule = movementEnumToModuleMap[DevMovementMode]
+	end
+	return touchModule, true
+end
+
+local function getGamepadRightThumbstickPosition(): Vector3
+	local state = UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)
+	for _, input in pairs(state) do
+		if input.KeyCode == Enum.KeyCode.Thumbstick2 then
+			return input.Position
+		end
+	end
+	return Vector3.new(0,0,0)
+end
+
+function ControlModule:calculateRawMoveVector(humanoid: Humanoid, cameraRelativeMoveVector: Vector3): Vector3
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return cameraRelativeMoveVector
+	end
+	local cameraCFrame = camera.CFrame
+
+	if VRService.VREnabled and humanoid.RootPart then
+		local vrFrame = VRService:GetUserCFrame(Enum.UserCFrame.Head)
+
+		vrFrame = self:GetEstimatedVRTorsoFrame()
+
+
+		local cameraDelta = camera.Focus.Position - cameraCFrame.Position
+		if cameraDelta.Magnitude < 3 then
+			cameraCFrame = cameraCFrame * vrFrame
+		else
+			cameraCFrame = camera.CFrame * (vrFrame.Rotation + vrFrame.Position * camera.HeadScale)
+		end
+	end
+
+	if humanoid:GetState() == Enum.HumanoidStateType.Swimming then
+		if VRService.VREnabled then
+			cameraRelativeMoveVector = Vector3.new(cameraRelativeMoveVector.X, 0, cameraRelativeMoveVector.Z)
+			if cameraRelativeMoveVector.Magnitude < 0.01 then
+				return Vector3.zero
+			end
+
+			local pitch = -getGamepadRightThumbstickPosition().Y * math.rad(80)
+			local yawAngle = math.atan2(-cameraRelativeMoveVector.X, -cameraRelativeMoveVector.Z)
+			local _, cameraYaw, _ = cameraCFrame:ToEulerAnglesYXZ()
+			yawAngle += cameraYaw
+			local movementCFrame = CFrame.fromEulerAnglesYXZ(pitch, yawAngle, 0)
+			return movementCFrame.LookVector
+		else
+			return cameraCFrame:VectorToWorldSpace(cameraRelativeMoveVector)
+		end
+	end
+
+	local c, s
+	local _, _, _, R00, R01, R02, _, _, R12, _, _, R22 = cameraCFrame:GetComponents()
+	if R12 < 1 and R12 > -1 then
+
+		c = R22
+		s = R02
+	else
+
+
+		c = R00
+		s = -R01*math.sign(R12)
+	end
+	local norm = math.sqrt(c*c + s*s)
+	return Vector3.new(
+		(c*cameraRelativeMoveVector.X + s*cameraRelativeMoveVector.Z)/norm,
+		0,
+		(c*cameraRelativeMoveVector.Z - s*cameraRelativeMoveVector.X)/norm
+	)
+end
+
+function ControlModule:OnRenderStepped(dt)
+	if self.activeController and self.activeController.enabled and self.humanoid then
+
+
+		local moveVector = self.activeController:GetMoveVector()
+		local cameraRelative = self.activeController:IsMoveVectorCameraRelative()
+
+		local clickToMoveController = self:GetClickToMoveController()
+		if self.activeController == clickToMoveController then
+			clickToMoveController:OnRenderStepped(dt)
+		else
+			if moveVector.magnitude > 0 then
+
+				clickToMoveController:CleanupPath()
+			else
+
+				clickToMoveController:OnRenderStepped(dt)
+				moveVector = clickToMoveController:GetMoveVector()
+				cameraRelative = clickToMoveController:IsMoveVectorCameraRelative()
+			end
+		end
+
+
+		local vehicleConsumedInput = false
+		if self.vehicleController then
+			moveVector, vehicleConsumedInput = self.vehicleController:Update(moveVector, cameraRelative, self.activeControlModule==Gamepad)
+		end
+
+
+		if cameraRelative then
+			moveVector = self:calculateRawMoveVector(self.humanoid, moveVector)
+		end
+
+		self.inputMoveVector = moveVector
+		if VRService.VREnabled then
+			moveVector = self:updateVRMoveVector(moveVector)
+		end
+
+		self.moveFunction(Players.LocalPlayer, moveVector, false)
+
+
+		self.humanoid.Jump = self.activeController:GetIsJumping() or (self.touchJumpController and self.touchJumpController:GetIsJumping())
+	end
+end
+
+function ControlModule:updateVRMoveVector(moveVector)
+	local curCamera = workspace.CurrentCamera :: Camera
+
+
+	local cameraDelta = curCamera.Focus.Position - curCamera.CFrame	.Position
+	local firstPerson = cameraDelta.Magnitude < FIRST_PERSON_THRESHOLD_DISTANCE and true
+
+
+	if moveVector.Magnitude == 0 and firstPerson and VRService.AvatarGestures and self.humanoid
+		and not self.humanoid.Sit then
+
+		local vrHeadOffset = VRService:GetUserCFrame(Enum.UserCFrame.Head)
+		vrHeadOffset = vrHeadOffset.Rotation + vrHeadOffset.Position * curCamera.HeadScale
+
+
+		local neck_offset = NECK_OFFSET * self.humanoid.RootPart.Size.Y / 2
+		local vrHeadWorld = curCamera.CFrame * vrHeadOffset * CFrame.new(0, neck_offset, 0)
+
+		local moveOffset = vrHeadWorld.Position - self.humanoid.RootPart.CFrame.Position
+		return Vector3.new(moveOffset.x, 0, moveOffset.z)
+	end
+
+	return moveVector
+end
+
+function ControlModule:OnHumanoidSeated(active: boolean, currentSeatPart: BasePart)
+	if active then
+		if currentSeatPart and currentSeatPart:IsA("VehicleSeat") then
+			if not self.vehicleController then
+				self.vehicleController = self.vehicleController.new(CONTROL_ACTION_PRIORITY)
+			end
+			self.vehicleController:Enable(true, currentSeatPart)
+		end
+	else
+		if self.vehicleController then
+			self.vehicleController:Enable(false, currentSeatPart)
+		end
+	end
+end
+
+function ControlModule:OnCharacterAdded(char)
+	self.humanoid = char:FindFirstChildOfClass("Humanoid")
+	while not self.humanoid do
+		char.ChildAdded:wait()
+		self.humanoid = char:FindFirstChildOfClass("Humanoid")
+	end
+
+	if self.humanoidSeatedConn then
+		self.humanoidSeatedConn:Disconnect()
+		self.humanoidSeatedConn = nil
+	end
+	self.humanoidSeatedConn = self.humanoid.Seated:Connect(function(active, currentSeatPart)
+		self:OnHumanoidSeated(active, currentSeatPart)
+	end)
+
+	self:UpdateMovementMode()
+end
+
+function ControlModule:OnCharacterRemoving(char)
+	self.humanoid = nil
+
+	self:UpdateMovementMode()
+end
+
+function ControlModule:UpdateTouchGuiVisibility()
+	local doShow = self.humanoid and GuiService.TouchControlsEnabled and UserInputService.PreferredInput == Enum.PreferredInput.Touch
+	if doShow and not self.touchGui then
+
+		self:CreateTouchGuiContainer()
+	end
+
+	if self.touchGui then
+		self.touchGui.Enabled = not not doShow
+	end
+end
+
+
+function ControlModule:SwitchToController(controlModule)
+
+	if not controlModule then
+		if self.activeController then
+			self.activeController:Enable(false)
+		end
+		self.activeController = nil
+		self.activeControlModule = nil
+		return
+	end
+
+
+	if not self.controllers[controlModule] then
+		self.controllers[controlModule] = controlModule.new(CONTROL_ACTION_PRIORITY)
+	end
+
+
+	if self.activeController ~= self.controllers[controlModule] then
+		if self.activeController then
+			self.activeController:Enable(false)
+		end
+		self.activeController = self.controllers[controlModule]
+		self.activeControlModule = controlModule
+
+		self:UpdateActiveControlModuleEnabled()
+	end
+end
+
+
+function ControlModule:UpdateMovementMode()
+	self:UpdateTouchGuiVisibility()
+
+	if UserInputService.PreferredInput == Enum.PreferredInput.Touch then
+		local touchModule, success = self:SelectTouchModule()
+		if success then
+			if self.touchControlFrame then
+				self:SwitchToController(touchModule)
+			end
+		end
+	else
+		local computerModule = self:SelectComputerMovementModule()
+		self:SwitchToController(computerModule)
+	end
+end
+
+function ControlModule:CreateTouchGuiContainer()
+	if not self.playerGui then
+		return
+	end
+
+	if self.touchGui then self.touchGui:Destroy() end
+
+
+	self.touchGui = Instance.new("ScreenGui")
+	self.touchGui.Name = "TouchGui"
+	self.touchGui.ResetOnSpawn = false
+	self.touchGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	if FFlagUserDynamicThumbstickSafeAreaUpdate then
+		self.touchGui.ClipToDeviceSafeArea = false;
+	end
+
+	self.touchControlFrame = Instance.new("Frame")
+	self.touchControlFrame.Name = "TouchControlFrame"
+	self.touchControlFrame.Size = UDim2.new(1, 0, 1, 0)
+	self.touchControlFrame.BackgroundTransparency = 1
+	self.touchControlFrame.Parent = self.touchGui
+
+	self.touchGui.Parent = self.playerGui
+end
+
+function ControlModule:GetClickToMoveController()
+	if not self.controllers[ClickToMove] then
+		self.controllers[ClickToMove] = ClickToMove.new(CONTROL_ACTION_PRIORITY)
+	end
+	return self.controllers[ClickToMove]
+end
+
+return ControlModule.new()
